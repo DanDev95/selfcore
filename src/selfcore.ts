@@ -104,54 +104,128 @@ class Selfcore {
 
   static Gateway = class extends EventEmitter {
     token: string;
-    interval: any;
     ws: WebSocket;
-    payload: object;
+    sessionId: string | null = null;
+    sequenceNumber: number | null = null;
+    heartbeatInterval: NodeJS.Timeout | null = null;
+    expectHeartbeatAck: boolean = false;
+    baseGatewayUrl: string = 'wss://gateway.discord.gg/?v=9&encoding=json';
+    resumeGatewayUrl: string = this.baseGatewayUrl;
 
     constructor(token: string) {
       super();
       this.token = token;
-      this.ws = new WebSocket("wss://gateway.discord.gg/?v=6&encoding=json");
-      this.payload = {
+      this.connectToGateway();
+    }
+
+    //connect to gateway and handle events
+    connectToGateway(resume = false) {
+      const url = resume ? this.resumeGatewayUrl : this.baseGatewayUrl;
+      this.ws = new WebSocket(url);
+
+      this.ws.on('open', () => {
+        if (resume) {
+          this.resumeSession();
+        }
+      });
+
+      this.ws.on('message', (data: string) => {
+        const response = JSON.parse(data);
+        if (response.s) this.sequenceNumber = response.s;
+        switch (response.op) {
+          case 10: // Hello event
+            this.handleHello(response.d.heartbeat_interval);
+            break;
+          case 11: // Heartbeat ACK
+            this.expectHeartbeatAck = false;
+            break;
+          case 9: // Invalid Session
+            this.ws.close(4000);
+            setTimeout(() => this.connectToGateway(false), 5000);
+            break;
+          case 7: // Reconnect request
+            this.ws.close(4000);
+            setTimeout(() => this.connectToGateway(true), 5000);
+            break;
+          case 0: // Dispatch
+            if (response.t === "MESSAGE_CREATE") {
+              this.emit("message", response.d);
+            } else if (response.t === "READY") {
+              this.sessionId = response.d.session_id;
+              this.resumeGatewayUrl = response.d.resume_gateway_url;
+            }
+            break;
+          default:
+            break;
+        }
+      });
+
+      this.ws.on('close', (code) => {
+        clearInterval(this.heartbeatInterval!);
+        const resumeCodes = [4000, 4001, 4002, 4003, 4005, 4006, 4007, 4008, 4009];
+        const canResume = typeof code === 'undefined' || resumeCodes.includes(code);
+        setTimeout(() => this.connectToGateway(canResume), 5000);
+      });
+    }
+
+    //handle hello event
+    handleHello(heartbeat_interval: number) {
+      this.heartbeatInterval = setInterval(() => {
+        if (this.expectHeartbeatAck) {
+          this.ws.close(4000); // Close connection if no ACK
+          return;
+        }
+        this.sendHeartbeat();
+        this.expectHeartbeatAck = true;
+      }, heartbeat_interval);
+    }
+
+    //send heartbeat to gateway
+    sendHeartbeat() {
+      if (this.sequenceNumber !== null) {
+        this.ws.send(JSON.stringify({ op: 1, d: this.sequenceNumber }));
+      }
+    }
+
+    //identify for the first connection
+    identify() {
+      let payload = {
         op: 2,
         d: {
           token: this.token,
           properties: {
             $os: "linux",
             $browser: "chrome",
-            $device: "chrome",
+            $device: "chrome"
           },
-        },
+          compress: false,
+          large_threshold: 250,
+          shard: [0, 1],
+          presence: {
+            status: 'online',
+            since: 0,
+            activities: [],
+            afk: false,
+          }
+        }
       };
-      this.ws.on("open", () => {
-        this.ws.send(JSON.stringify(this.payload));
-      });
-
-      this.ws.on("message", (data: string) => {
-        let payload = JSON.parse(data);
-        const { t, event, op, d } = payload;
-
-        switch (op) {
-          case 10:
-            const { heartbeat_interval } = d;
-            this.interval = this.heartbeat(heartbeat_interval);
-            this.emit("ready");
-            break;
-        }
-
-        switch (t) {
-          case "MESSAGE_CREATE":
-            // console.log(d);
-            this.emit("message", d);
-        }
-      });
+      this.ws.send(JSON.stringify(payload));
     }
-    heartbeat = (ms: number) => {
-      return setInterval(() => {
-        this.ws.send(JSON.stringify({ op: 1, d: null }));
-      }, ms);
-    };
+
+    //resume session after disconnection
+    resumeSession() {
+      if (this.sessionId && this.sequenceNumber) {
+        let payload = {
+          op: 6,
+          d: {
+            token: this.token,
+            session_id: this.sessionId,
+            seq: this.sequenceNumber
+          }
+        };
+        this.ws.send(JSON.stringify(payload));
+      }
+    }
   };
 }
-
 export default Selfcore;
