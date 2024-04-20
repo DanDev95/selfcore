@@ -163,47 +163,117 @@ var selfcore = /** @class */ (function () {
         __extends(class_1, _super);
         function class_1(token) {
             var _this = _super.call(this) || this;
-            _this.heartbeat = function (ms) {
-                return setInterval(function () {
-                    _this.ws.send(JSON.stringify({ op: 1, d: null }));
-                }, ms);
-            };
             _this.token = token;
-            _this.ws = new ws_1["default"]("wss://gateway.discord.gg/?v=6&encoding=json");
-            _this.payload = {
-                op: 2,
-                d: {
-                    token: _this.token,
-                    properties: {
-                        $os: "linux",
-                        $browser: "chrome",
-                        $device: "chrome"
-                    }
-                }
-            };
-            _this.ws.on("open", function () {
-                _this.ws.send(JSON.stringify(_this.payload));
-            });
-            _this.ws.on("message", function (data) {
-                var payload = JSON.parse(data);
-                var t = payload.t, event = payload.event, op = payload.op, d = payload.d;
-                switch (op) {
-                    case 10:
-                        var heartbeat_interval = d.heartbeat_interval;
-                        _this.interval = _this.heartbeat(heartbeat_interval);
-                        _this.emit("ready");
-                        break;
-                }
-                switch (t) {
-                    case "MESSAGE_CREATE":
-                        var author = d.author.username;
-                        var content = d.content;
-                        // console.log(d);
-                        _this.emit("message", d);
-                }
-            });
+            _this.sessionId = null;
+            _this.sequenceNumber = null;
+            _this.heartbeatInterval = null;
+            _this.expectHeartbeatAck = false;
+            _this.baseGatewayUrl = 'wss://gateway.discord.gg/?v=9&encoding=json';
+            _this.resumeGatewayUrl = _this.baseGatewayUrl;
+            _this.connectToGateway();
             return _this;
         }
+
+        class_1.prototype.connectToGateway = function (resume = false) {
+            const url = resume ? this.resumeGatewayUrl : this.baseGatewayUrl;
+            this.ws = new ws_1["default"](url);
+
+            this.ws.on('open', () => {
+                if (resume) {
+                    this.resumeSession();
+                }
+            });
+
+            this.ws.on('message', (data) => {
+                const response = JSON.parse(data);
+                if (response.s) this.sequenceNumber = response.s;
+                switch (response.op) {
+                    case 10: // Hello event
+                        this.handleHello(response.d.heartbeat_interval);
+                        break;
+                    case 11: // Heartbeat ACK received
+                        this.expectHeartbeatAck = false;
+                        break;
+                    case 1: //need to send an heartbeat
+                        this.sendHeartbeat();
+                        break
+                    case 7: //need to resume
+                        this.ws.close(4000);
+                        break
+                    case 9: // Invalid Session
+                        const closeCode = response.d ? 4000 : 1000;
+                        this.ws.close(closeCode);
+                        break;
+                    case 0: // Dispatch
+                        if (response.t === "MESSAGE_CREATE") {
+                            var author = response.d.author.username;
+                            var content = response.d.content;
+                            _this.emit("message", d);
+                        }else if (response.t === "READY") {
+                            this.sessionId = response.d.session_id;
+                            this.resume_gateway_url = response.d.resume_gateway_url;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+            });
+
+            this.ws.on('close', (code) => {
+                clearInterval(this.heartbeatInterval);
+                const resumeCodes = [4000, 4001, 4002, 4003, 4005, 4006, 4007, 4008, 4009];
+                const canResume = typeof code === 'undefined' || resumeCodes.includes(code);
+                setTimeout(() => this.connectToGateway(canResume), 5000);
+            });
+        }
+
+        class_1.prototype.handleHello = function (heartbeat_interval) {
+            this.heartbeatInterval = setInterval(() => {
+                if (this.expectHeartbeatAck) {
+                    this.ws.close(4000);
+                    return;
+                }
+                this.sendHeartbeat();
+                this.expectHeartbeatAck = true;
+            }, heartbeat_interval);
+          
+            this.identify();
+        };
+
+        class_1.prototype.sendHeartbeat = function () {
+            this.ws.send(JSON.stringify({ op: 1, d: this.sequenceNumber }));
+        };
+
+        class_1.prototype.identify = function () {
+            let payload = {
+              op: 2,
+              d: {
+                token: this.token,
+                properties: {
+                  $os: "linux",
+                  $browser: "chrome",
+                  $device: "chrome"
+                },
+              }
+            };
+            this.ws.send(JSON.stringify(payload));
+          };
+
+        class_1.prototype.resumeSession = function () {
+            this.ws.send(JSON.stringify({
+              op: 6,
+              d: {
+                token: this.token,
+                properties: {
+                  $os: "linux",
+                  $browser: "chrome",
+                  $device: "chrome"
+                },
+                session_id: this.sessionId,
+                seq: this.sequenceNumber
+              }
+            }));
+          };
         return class_1;
     }(events_1["default"]));
     return selfcore;
